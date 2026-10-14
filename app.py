@@ -11,7 +11,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-DATA_PATH = Path(__file__).resolve().parent / "patients.csv"
+# default fallback filename the app used previously
+DEFAULT_FILENAME = "patients.csv"
 TARGET_COLUMN = "Result"
 
 
@@ -71,6 +72,35 @@ def get_numeric_columns(df: pd.DataFrame) -> list[str]:
     return numeric_columns
 
 
+def find_csv_files() -> list[Path]:
+    """Search for CSV files in sensible locations: repo root and data/ directories."""
+    base = Path(__file__).resolve().parent
+    candidates: list[Path] = []
+    root_file = base / DEFAULT_FILENAME
+    if root_file.exists():
+        candidates.append(root_file)
+
+    data_dir = base / "data"
+    if data_dir.exists() and data_dir.is_dir():
+        for p in sorted(data_dir.rglob("*.csv")):
+            candidates.append(p)
+
+    # also check data/liver specifically (download script target)
+    liver_dir = base / "data" / "liver"
+    if liver_dir.exists() and liver_dir.is_dir():
+        for p in sorted(liver_dir.rglob("*.csv")):
+            candidates.append(p)
+
+    # dedupe while preserving order
+    seen = set()
+    unique = []
+    for p in candidates:
+        if str(p) not in seen:
+            seen.add(str(p))
+            unique.append(p)
+    return unique
+
+
 def main() -> None:
     st.set_page_config(page_title="Healthcare Analytics Dashboard", layout="wide")
     st.markdown(
@@ -93,22 +123,66 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    if not DATA_PATH.exists():
-        st.error(f"Dataset not found: {DATA_PATH}")
+    csv_files = find_csv_files()
+
+    st.title("Healthcare Analytics Dashboard")
+
+    selected_df = None
+    selected_path = None
+
+    if csv_files:
+        options = [str(p.relative_to(Path(__file__).resolve().parent)) for p in csv_files]
+        options.append("Upload a local file")
+        choice = st.selectbox("Select a dataset to load", options, index=0)
+        if choice == "Upload a local file":
+            uploaded = st.file_uploader("Upload a CSV file", type="csv")
+            if uploaded is not None:
+                try:
+                    selected_df = pd.read_csv(uploaded)
+                except Exception as e:
+                    st.error(f"Could not read uploaded file: {e}")
+                    st.stop()
+        else:
+            selected_path = Path(__file__).resolve().parent / choice
+    else:
+        st.info(
+            "No dataset found in the repository. You can run scripts/download_kaggle.py to download the Kaggle dataset into data/, or upload a CSV file below."
+        )
+        uploaded = st.file_uploader("Upload a CSV file", type="csv")
+        if uploaded is not None:
+            try:
+                selected_df = pd.read_csv(uploaded)
+            except Exception as e:
+                st.error(f"Could not read uploaded file: {e}")
+                st.stop()
+
+    # If a path was selected, try to load it
+    if selected_df is None and selected_path is not None:
+        if not selected_path.exists():
+            st.error(f"Dataset not found: {selected_path}")
+            st.stop()
+        try:
+            selected_df = load_data(str(selected_path))
+        except Exception as e:
+            st.error(f"Failed to load dataset: {e}")
+            st.stop()
+
+    if selected_df is None:
         st.stop()
 
-    df = load_data(str(DATA_PATH))
+    df = selected_df
+
     if df.empty:
         st.warning("The dataset is empty.")
         st.stop()
-
-    st.title("Healthcare Analytics Dashboard")
 
     try:
         accuracy, test_records = evaluate_model(df)
     except (KeyError, ValueError) as error:
         st.error(f"Could not calculate model accuracy: {error}")
-        st.stop()
+        # continue to show dataset preview even if model evaluation failed
+        accuracy = None
+        test_records = 0
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -116,7 +190,11 @@ def main() -> None:
     with col2:
         st.metric("Total Columns", len(df.columns))
     with col3:
-        st.metric("Test Accuracy", f"{accuracy:.1%}", help=f"Measured on {test_records} held-out records.")
+        if accuracy is not None:
+            st.metric("Test Accuracy", f"{accuracy:.1%}", help=f"Measured on {test_records} held-out records.")
+        else:
+            st.metric("Test Accuracy", "N/A", help="Model evaluation failed for this dataset.")
+
     st.caption(
         "Accuracy is from a baseline logistic-regression model evaluated on a stratified "
         "20% test split. It is an estimate, not evidence of clinical validity."
